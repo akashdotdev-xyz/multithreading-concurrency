@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 type BoundedQueue struct {
@@ -52,6 +53,64 @@ func (q *BoundedQueue) Pop() int {
 
 	q.notFull.Signal()
 	return item
+}
+
+// PushTimeout and PopTimeout give up after d instead of blocking forever.
+// sync.Cond has no native timed wait, so a timer is armed to Broadcast()
+// after the deadline, forcing every waiter on that Cond to wake and
+// recheck — same as any other wakeup, the loop re-verifies both the
+// predicate AND the remaining time, since a real Push/Pop and a timeout
+// can race to wake the same waiter in the same window.
+func (q *BoundedQueue) PushTimeout(item int, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	q.mu.Lock()
+	for q.count == q.capacity {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			q.mu.Unlock()
+			return false
+		}
+		timer := time.AfterFunc(remaining, func() {
+			q.mu.Lock()
+			q.notFull.Broadcast()
+			q.mu.Unlock()
+		})
+		q.notFull.Wait()
+		timer.Stop()
+	}
+	q.buf[q.tail] = item
+	q.tail = (q.tail + 1) % q.capacity
+	q.count++
+	q.mu.Unlock()
+
+	q.notEmpty.Signal()
+	return true
+}
+
+func (q *BoundedQueue) PopTimeout(d time.Duration) (item int, ok bool) {
+	deadline := time.Now().Add(d)
+	q.mu.Lock()
+	for q.count == 0 {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			q.mu.Unlock()
+			return 0, false
+		}
+		timer := time.AfterFunc(remaining, func() {
+			q.mu.Lock()
+			q.notEmpty.Broadcast()
+			q.mu.Unlock()
+		})
+		q.notEmpty.Wait()
+		timer.Stop()
+	}
+	item = q.buf[q.head]
+	q.head = (q.head + 1) % q.capacity
+	q.count--
+	q.mu.Unlock()
+
+	q.notFull.Signal()
+	return item, true
 }
 
 const (
@@ -172,6 +231,62 @@ func runOrderCheck() bool {
 	return true
 }
 
+type popResult struct {
+	val int
+	ok  bool
+}
+
+func runTimeoutCheck() bool {
+	q := NewBoundedQueue(2)
+
+	start := time.Now()
+	if _, ok := q.PopTimeout(30 * time.Millisecond); ok {
+		fmt.Println("FAILED (timeout): PopTimeout on empty queue unexpectedly succeeded")
+		return false
+	}
+	if elapsed := time.Since(start); elapsed < 25*time.Millisecond || elapsed > 200*time.Millisecond {
+		fmt.Printf("FAILED (timeout): PopTimeout elapsed %v, expected ~30ms\n", elapsed)
+		return false
+	}
+
+	if !q.PushTimeout(1, 10*time.Millisecond) || !q.PushTimeout(2, 10*time.Millisecond) {
+		fmt.Println("FAILED (timeout): PushTimeout on non-full queue unexpectedly failed")
+		return false
+	}
+	start = time.Now()
+	if q.PushTimeout(3, 30*time.Millisecond) {
+		fmt.Println("FAILED (timeout): PushTimeout on full queue unexpectedly succeeded")
+		return false
+	}
+	if elapsed := time.Since(start); elapsed < 25*time.Millisecond || elapsed > 200*time.Millisecond {
+		fmt.Printf("FAILED (timeout): PushTimeout elapsed %v, expected ~30ms\n", elapsed)
+		return false
+	}
+
+	// A blocked PopTimeout should wake almost immediately on a real Push,
+	// not sit until its (much longer) deadline.
+	q2 := NewBoundedQueue(1)
+	resultCh := make(chan popResult, 1)
+	go func() {
+		v, ok := q2.PopTimeout(500 * time.Millisecond)
+		resultCh <- popResult{v, ok}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	pushStart := time.Now()
+	q2.Push(42)
+	res := <-resultCh
+	if !res.ok || res.val != 42 {
+		fmt.Printf("FAILED (timeout): expected interrupted PopTimeout to get 42, got val=%d ok=%v\n", res.val, res.ok)
+		return false
+	}
+	if elapsed := time.Since(pushStart); elapsed > 100*time.Millisecond {
+		fmt.Printf("FAILED (timeout): PopTimeout took %v to notice a real push, should be near-instant\n", elapsed)
+		return false
+	}
+
+	return true
+}
+
 func main() {
 	if !runCompletenessCheck() {
 		os.Exit(1)
@@ -179,5 +294,8 @@ func main() {
 	if !runOrderCheck() {
 		os.Exit(1)
 	}
-	fmt.Printf("OK: %d items, completeness + per-producer FIFO order both hold\n", numProducers*itemsPerProducer)
+	if !runTimeoutCheck() {
+		os.Exit(1)
+	}
+	fmt.Printf("OK: %d items, completeness + per-producer FIFO order + timeout variants all hold\n", numProducers*itemsPerProducer)
 }
